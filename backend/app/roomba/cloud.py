@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -64,15 +65,28 @@ def _get_json(url: str, headers: dict[str, str] | None = None) -> Any:
         return json.loads(resp.read().decode("utf-8", "replace"))
 
 
-def _discover() -> tuple[str, list[str]]:
+def _discover() -> tuple[str, str, list[str]]:
+    """Retourne (api_key Gigya, URL accounts.login, URLs /v2/login candidates).
+
+    Aligné sur dorita980 4.0.0 (fév. 2026) : clé + datacenter Gigya et
+    httpBase viennent de la découverte, jamais des endpoints "auth" signés AWS.
+    """
     api_key = DEFAULT_GIGYA_API_KEY
+    gigya_login = GIGYA_LOGIN
     login_urls = list(FALLBACK_LOGINS)
-    try:
-        disc = _get_json(DISCOVERY_URL)
-    except Exception:
-        return api_key, login_urls
+    disc = None
+    for _ in range(3):  # DNS/réseau parfois capricieux : on réessaie
+        try:
+            disc = _get_json(DISCOVERY_URL)
+            break
+        except Exception:  # noqa: BLE001
+            time.sleep(1.5)
+    if not disc:
+        return api_key, gigya_login, login_urls
     gigya = disc.get("gigya") or {}
     api_key = gigya.get("api_key") or api_key
+    if gigya.get("datacenter_domain"):
+        gigya_login = f"https://accounts.{gigya['datacenter_domain']}/accounts.login"
     urls: list[str] = []
     current = disc.get("current_deployment")
     deployments = disc.get("deployments") or {}
@@ -82,7 +96,7 @@ def _discover() -> tuple[str, list[str]]:
         order = list(deployments.keys())
     for key in order:
         dep = deployments.get(key) or {}
-        for field in ("httpBase", "httpBaseAuth"):
+        for field in ("httpBase",):  # httpBaseAuth exige une signature AWS -> 403/500
             base = dep.get(field)
             if base:
                 candidate = base.rstrip("/") + "/v2/login"
@@ -91,26 +105,39 @@ def _discover() -> tuple[str, list[str]]:
     for url in login_urls:
         if url not in urls:
             urls.append(url)
-    return api_key, urls or login_urls
+    return api_key, gigya_login, urls or login_urls
+
+
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    try:
+        body = exc.read().decode("utf-8", "replace")[:300]
+    except Exception:  # noqa: BLE001
+        body = ""
+    return f"HTTP {exc.code} sur {exc.url} {body}".strip()
 
 
 def retrieve(email: str, password: str) -> dict[str, Any]:
     """Retourne {robots:[{blid,password,name,sku}], error?, detail?}."""
-    api_key, login_urls = _discover()
+    api_key, gigya_login, login_urls = _discover()
     try:
         gigya = _post_form(
-            GIGYA_LOGIN,
+            gigya_login,
             {
                 "apiKey": api_key,
                 "targetenv": "mobile",
-                "loginID": email,
+                "targetEnv": "mobile",
+                "loginID": email.strip(),
                 "password": password,
                 "format": "json",
             },
         )
+    except urllib.error.HTTPError as exc:
+        return {"robots": [], "error": "network", "detail": f"Gigya: {_http_error_detail(exc)}"}
     except Exception as exc:  # noqa: BLE001
         return {"robots": [], "error": "network", "detail": f"Connexion Gigya impossible: {exc}"}
 
+    if gigya.get("errorCode") == 403042:
+        return {"robots": [], "error": "auth", "detail": "E-mail ou mot de passe iRobot incorrect."}
     if gigya.get("errorCode") not in (0, None):
         msg = gigya.get("errorDetails") or gigya.get("errorMessage") or str(gigya.get("errorCode"))
         return {"robots": [], "error": "auth", "detail": f"Authentification refusée: {msg}"}
@@ -136,7 +163,7 @@ def retrieve(email: str, password: str) -> dict[str, Any]:
                 login = _post_json(url, payload) if mode == "json" else _post_form(url, payload)
                 break
             except urllib.error.HTTPError as exc:
-                last_exc = exc
+                last_exc = RuntimeError(_http_error_detail(exc))
                 # 404/405 -> autre forme/endpoint peut marcher ; 5xx -> essayer suivant.
                 continue
             except Exception as exc:  # noqa: BLE001
